@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>C# HTTPS Server</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Welcome to the Custom C# HTTPS Server</h1>
+        <p>This page is being served statically from the <code>public</code> directory.</p>
+        <button id="api-btn">Test JSON API</button>
+        <div id="api-result"></div>
+        
+        <h2>Test POST Request</h2>
+        <form id="post-form">
+            <input type="text" id="post-data" placeholder="Enter some data..." required>
+            <button type="submit">Send POST</button>
+        </form>
+        <div id="post-result"></div>
+    </div>
+
+    <script>
+        document.getElementById('api-btn').addEventListener('click', async () => {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                document.getElementById('api-result').innerHTML = `<pre>${JSON.stringify(data, null, 2)}</pre>`;
+            } catch (error) {
+                document.getElementById('api-result').innerText = 'Error fetching API';
+            }
+        });
+
+        document.getElementById('post-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const data = document.getElementById('post-data').value;
+            try {
+                const response = await fetch('/api/data', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: data })
+                });
+                const result = await response.json();
+                document.getElementById('post-result').innerHTML = `<pre>${JSON.stringify(result, null, 2)}</pre>`;
+            } catch (error) {
+                document.getElementById('post-result').innerText = 'Error sending POST request';
+            }
+        });
+    </script>
+</body>
+</html>

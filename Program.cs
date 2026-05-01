@@ -1,17 +1,21 @@
 using System;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.Security;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Text.Json;
 using System.Threading.Tasks;
+using System.Collections.Generic;
 
 namespace HttpsServer
 {
     class Program
     {
         static X509Certificate2? serverCertificate = null;
+        static readonly string PublicDir = Path.Combine(Directory.GetCurrentDirectory(), "public");
 
         static async Task Main(string[] args)
         {
@@ -64,48 +68,66 @@ namespace HttpsServer
 
                     await sslStream.AuthenticateAsServerAsync(sslOptions);
 
-                    // Read the HTTP request
-                    byte[] buffer = new byte[8192];
-                    int bytesRead = await sslStream.ReadAsync(buffer, 0, buffer.Length);
-                    string request = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-
-                    if (!string.IsNullOrEmpty(request))
+                    // Read request headers
+                    var headerBytesList = new List<byte>();
+                    byte[] singleByteBuffer = new byte[1];
+                    while (await sslStream.ReadAsync(singleByteBuffer, 0, 1) > 0)
                     {
-                        Console.WriteLine("--- New Request ---");
-                        var firstLine = request.Split('\n')[0].Trim();
-                        Console.WriteLine(firstLine);
-
-                        // Basic router
-                        string responseBody = "";
-                        string statusCode = "200 OK";
-
-                        if (firstLine.StartsWith("GET / ") || firstLine.StartsWith("GET /HTTP"))
+                        headerBytesList.Add(singleByteBuffer[0]);
+                        if (headerBytesList.Count >= 4 &&
+                            headerBytesList[^4] == '\r' && headerBytesList[^3] == '\n' &&
+                            headerBytesList[^2] == '\r' && headerBytesList[^1] == '\n')
                         {
-                            responseBody = "<html><body><h1>Hello from low-level C# HTTPS Server!</h1><p>You requested the root path.</p></body></html>";
+                            break;
                         }
-                        else if (firstLine.StartsWith("GET /about "))
-                        {
-                            responseBody = "<html><body><h1>About Page</h1><p>This is a custom HTTPS server.</p></body></html>";
-                        }
-                        else
-                        {
-                            statusCode = "404 Not Found";
-                            responseBody = "<html><body><h1>404 Not Found</h1></body></html>";
-                        }
-
-                        string response = 
-                            $"HTTP/1.1 {statusCode}\r\n" +
-                            "Content-Type: text/html; charset=UTF-8\r\n" +
-                            "Connection: close\r\n" +
-                            "Server: Custom C# HttpsServer\r\n" +
-                            $"Content-Length: {Encoding.UTF8.GetByteCount(responseBody)}\r\n" +
-                            "\r\n" +
-                            responseBody;
-
-                        byte[] responseBytes = Encoding.UTF8.GetBytes(response);
-                        await sslStream.WriteAsync(responseBytes, 0, responseBytes.Length);
-                        await sslStream.FlushAsync();
                     }
+
+                    if (headerBytesList.Count == 0) return;
+
+                    string headersText = Encoding.UTF8.GetString(headerBytesList.ToArray());
+                    string[] headerLines = headersText.Split(new[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries);
+                    
+                    if (headerLines.Length == 0) return;
+
+                    string requestLine = headerLines[0];
+                    Console.WriteLine($"--- New Request ---");
+                    Console.WriteLine(requestLine);
+
+                    string[] requestParts = requestLine.Split(' ');
+                    if (requestParts.Length < 3) return;
+
+                    string method = requestParts[0];
+                    string path = requestParts[1];
+
+                    // Extract headers
+                    var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    for (int i = 1; i < headerLines.Length; i++)
+                    {
+                        int separatorIdx = headerLines[i].IndexOf(':');
+                        if (separatorIdx > 0)
+                        {
+                            string key = headerLines[i].Substring(0, separatorIdx).Trim();
+                            string value = headerLines[i].Substring(separatorIdx + 1).Trim();
+                            headers[key] = value;
+                        }
+                    }
+
+                    // Read body if Content-Length is present
+                    string body = "";
+                    if (headers.TryGetValue("Content-Length", out string? contentLengthStr) && int.TryParse(contentLengthStr, out int contentLength))
+                    {
+                        byte[] bodyBytes = new byte[contentLength];
+                        int totalBytesRead = 0;
+                        while (totalBytesRead < contentLength)
+                        {
+                            int bytesRead = await sslStream.ReadAsync(bodyBytes, totalBytesRead, contentLength - totalBytesRead);
+                            if (bytesRead == 0) break;
+                            totalBytesRead += bytesRead;
+                        }
+                        body = Encoding.UTF8.GetString(bodyBytes);
+                    }
+
+                    await HandleRouteAsync(sslStream, method, path, body);
                 }
                 catch (AuthenticationException e)
                 {
@@ -116,6 +138,121 @@ namespace HttpsServer
                     Console.WriteLine($"Exception: {e.Message}");
                 }
             }
+        }
+
+        static async Task HandleRouteAsync(SslStream stream, string method, string path, string body)
+        {
+            if (method == "GET")
+            {
+                if (path.StartsWith("/api/status"))
+                {
+                    var responseObj = new { status = "running", timestamp = DateTime.UtcNow, version = "1.1" };
+                    await SendJsonResponseAsync(stream, 200, "OK", responseObj);
+                    return;
+                }
+
+                // Default to static files
+                if (path == "/") path = "/index.html";
+                await ServeStaticFileAsync(stream, path);
+            }
+            else if (method == "POST")
+            {
+                if (path == "/api/data")
+                {
+                    try
+                    {
+                        // Echo the parsed body back with an acknowledgment
+                        var data = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(body);
+                        var responseObj = new { message = "Data received successfully", receivedData = data };
+                        await SendJsonResponseAsync(stream, 200, "OK", responseObj);
+                    }
+                    catch
+                    {
+                        await SendJsonResponseAsync(stream, 400, "Bad Request", new { error = "Invalid JSON payload" });
+                    }
+                }
+                else
+                {
+                    await SendResponseAsync(stream, 404, "Not Found", "text/plain", "Not Found");
+                }
+            }
+            else
+            {
+                await SendResponseAsync(stream, 405, "Method Not Allowed", "text/plain", "Method Not Allowed");
+            }
+        }
+
+        static async Task ServeStaticFileAsync(SslStream stream, string path)
+        {
+            // Simple path traversal prevention
+            if (path.Contains(".."))
+            {
+                await SendResponseAsync(stream, 403, "Forbidden", "text/plain", "Forbidden");
+                return;
+            }
+
+            string filePath = Path.Combine(PublicDir, path.TrimStart('/'));
+            if (File.Exists(filePath))
+            {
+                string contentType = GetContentType(filePath);
+                byte[] fileBytes = await File.ReadAllBytesAsync(filePath);
+                
+                string headers = 
+                    $"HTTP/1.1 200 OK\r\n" +
+                    $"Content-Type: {contentType}\r\n" +
+                    "Connection: close\r\n" +
+                    $"Content-Length: {fileBytes.Length}\r\n" +
+                    "\r\n";
+                
+                byte[] headerBytes = Encoding.UTF8.GetBytes(headers);
+                await stream.WriteAsync(headerBytes);
+                await stream.WriteAsync(fileBytes);
+                await stream.FlushAsync();
+            }
+            else
+            {
+                await SendResponseAsync(stream, 404, "Not Found", "text/html", "<html><body><h1>404 Not Found</h1></body></html>");
+            }
+        }
+
+        static async Task SendJsonResponseAsync(SslStream stream, int statusCode, string statusText, object data)
+        {
+            string json = JsonSerializer.Serialize(data);
+            await SendResponseAsync(stream, statusCode, statusText, "application/json", json);
+        }
+
+        static async Task SendResponseAsync(SslStream stream, int statusCode, string statusText, string contentType, string body)
+        {
+            byte[] bodyBytes = Encoding.UTF8.GetBytes(body);
+            string headers = 
+                $"HTTP/1.1 {statusCode} {statusText}\r\n" +
+                $"Content-Type: {contentType}; charset=UTF-8\r\n" +
+                "Connection: close\r\n" +
+                $"Content-Length: {bodyBytes.Length}\r\n" +
+                "\r\n";
+
+            byte[] headerBytes = Encoding.UTF8.GetBytes(headers);
+            await stream.WriteAsync(headerBytes);
+            await stream.WriteAsync(bodyBytes);
+            await stream.FlushAsync();
+        }
+
+        static string GetContentType(string filePath)
+        {
+            string ext = Path.GetExtension(filePath).ToLowerInvariant();
+            return ext switch
+            {
+                ".html" => "text/html",
+                ".css" => "text/css",
+                ".js" => "application/javascript",
+                ".json" => "application/json",
+                ".png" => "image/png",
+                ".jpg" => "image/jpeg",
+                ".jpeg" => "image/jpeg",
+                ".gif" => "image/gif",
+                ".txt" => "text/plain",
+                _ => "application/octet-stream"
+            };
         }
     }
 }
