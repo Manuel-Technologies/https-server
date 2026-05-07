@@ -7,6 +7,8 @@ A full-fledged, low-level HTTPS server built in C# using pure sockets (`TcpListe
 - **Low-Level Socket Communication:** Uses `TcpListener` for accepting raw TCP connections.
 - **TLS/SSL Encryption:** Secures connections using `SslStream` and X.509 certificates.
 - **Custom HTTP Routing:** Includes a basic router to handle different HTTP paths (`/`, `/about`).
+- **Middleware Pipeline:** Runs each request through composable middleware before routing.
+- **Parsed Requests:** Exposes decoded query string values and parsed JSON, form-url-encoded, or text request bodies to handlers.
 - **Asynchronous Request Handling:** Efficiently handles multiple concurrent clients using `async`/`await`.
 - **No External Dependencies:** Built entirely with standard .NET libraries.
 
@@ -54,6 +56,15 @@ curl.exe -k https://localhost:8443/
 
 # Test the about page
 curl.exe -k https://localhost:8443/about
+
+# Test parsed query string values
+curl.exe -k "https://localhost:8443/api/status?name=codex&tag=one&tag=two"
+
+# Test JSON request body parsing
+curl.exe -k -X POST https://localhost:8443/api/data -H "Content-Type: application/json" -d "{\"message\":\"hello\"}"
+
+# Test form request body parsing
+curl.exe -k -X POST https://localhost:8443/api/data -H "Content-Type: application/x-www-form-urlencoded" -d "name=codex&tag=one&tag=two"
 ```
 
 ## Architecture

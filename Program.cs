@@ -14,10 +14,33 @@ using System.Security.Cryptography;
 
 namespace HttpsServer
 {
+    delegate Task Middleware(HttpContext context, Func<Task> next);
+
+    class HttpRequest
+    {
+        public string Method { get; init; } = "";
+        public string Path { get; init; } = "";
+        public string QueryString { get; init; } = "";
+        public Dictionary<string, List<string>> Query { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, string> Headers { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+        public string Body { get; init; } = "";
+        public object? ParsedBody { get; init; }
+        public bool KeepAlive { get; init; }
+    }
+
+    class HttpContext
+    {
+        public required SslStream Stream { get; init; }
+        public required HttpRequest Request { get; init; }
+        public Dictionary<string, object?> Items { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public bool ResponseStarted { get; set; }
+    }
+
     class Program
     {
         static X509Certificate2? serverCertificate = null;
         static readonly string PublicDir = Path.Combine(Directory.GetCurrentDirectory(), "public");
+        static readonly List<Middleware> MiddlewarePipeline = BuildMiddlewarePipeline();
 
         static async Task Main(string[] args)
         {
@@ -129,17 +152,7 @@ namespace HttpsServer
 
                         string method = requestParts[0];
                         string fullUrl = requestParts[1];
-                        
-                        // Parse URL and Query String
-                        string path = fullUrl;
-                        string queryString = "";
-                        int queryIdx = fullUrl.IndexOf('?');
-                        if (queryIdx >= 0)
-                        {
-                            path = fullUrl.Substring(0, queryIdx);
-                            queryString = fullUrl.Substring(queryIdx + 1);
-                        }
-                        path = Uri.UnescapeDataString(path);
+                        (string path, string queryString, Dictionary<string, List<string>> query) = ParseUrl(fullUrl);
 
                         // Extract headers
                         var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -179,7 +192,25 @@ namespace HttpsServer
                             body = Encoding.UTF8.GetString(bodyBytes);
                         }
 
-                        await HandleRouteAsync(sslStream, method, path, queryString, body, keepAlive);
+                        var request = new HttpRequest
+                        {
+                            Method = method,
+                            Path = path,
+                            QueryString = queryString,
+                            Query = query,
+                            Headers = headers,
+                            Body = body,
+                            ParsedBody = ParseRequestBody(headers, body),
+                            KeepAlive = keepAlive
+                        };
+
+                        var context = new HttpContext
+                        {
+                            Stream = sslStream,
+                            Request = request
+                        };
+
+                        await ExecutePipelineAsync(context);
                     }
                 }
                 catch (AuthenticationException e)
@@ -197,62 +228,196 @@ namespace HttpsServer
             }
         }
 
-        static async Task HandleRouteAsync(SslStream stream, string method, string path, string queryString, string body, bool keepAlive)
+        static List<Middleware> BuildMiddlewarePipeline()
         {
-            if (method == "OPTIONS")
+            return new List<Middleware>
             {
-                await SendResponseAsync(stream, 204, "No Content", "text/plain", "", keepAlive, true);
-                return;
+                async (context, next) =>
+                {
+                    Console.WriteLine($"{context.Request.Method} {context.Request.Path}");
+                    await next();
+                },
+                async (context, next) =>
+                {
+                    context.Items["request.startedAt"] = DateTime.UtcNow;
+                    await next();
+                },
+                async (context, next) =>
+                {
+                    if (context.Request.Method == "OPTIONS")
+                    {
+                        await SendResponseAsync(context, 204, "No Content", "text/plain", "", true);
+                        return;
+                    }
+
+                    await next();
+                },
+                HandleRouteAsync
+            };
+        }
+
+        static Task ExecutePipelineAsync(HttpContext context)
+        {
+            int index = -1;
+
+            Task Next()
+            {
+                index++;
+                if (index >= MiddlewarePipeline.Count || context.ResponseStarted)
+                {
+                    return Task.CompletedTask;
+                }
+
+                return MiddlewarePipeline[index](context, Next);
             }
 
-            if (method == "GET")
+            return Next();
+        }
+
+        static async Task HandleRouteAsync(HttpContext context, Func<Task> next)
+        {
+            HttpRequest request = context.Request;
+
+            if (request.Method == "GET")
             {
-                if (path.StartsWith("/api/status"))
+                if (request.Path.StartsWith("/api/status"))
                 {
-                    var responseObj = new { status = "running", timestamp = DateTime.UtcNow, version = "1.1", query = queryString };
-                    await SendJsonResponseAsync(stream, 200, "OK", responseObj, keepAlive);
+                    var responseObj = new
+                    {
+                        status = "running",
+                        timestamp = DateTime.UtcNow,
+                        version = "1.2",
+                        queryString = request.QueryString,
+                        query = request.Query
+                    };
+                    await SendJsonResponseAsync(context, 200, "OK", responseObj);
                     return;
                 }
 
                 // Default to static files
-                if (path == "/") path = "/index.html";
-                await ServeStaticFileAsync(stream, path, keepAlive);
+                string staticPath = request.Path == "/" ? "/index.html" : request.Path;
+                await ServeStaticFileAsync(context, staticPath);
             }
-            else if (method == "POST")
+            else if (request.Method == "POST")
             {
-                if (path == "/api/data")
+                if (request.Path == "/api/data")
                 {
-                    try
+                    if (request.ParsedBody is null && !string.IsNullOrWhiteSpace(request.Body))
                     {
-                        var data = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(body);
-                        var responseObj = new { message = "Data received successfully", receivedData = data };
-                        await SendJsonResponseAsync(stream, 200, "OK", responseObj, keepAlive);
+                        await SendJsonResponseAsync(context, 400, "Bad Request", new { error = "Unsupported or invalid request body" });
+                        return;
                     }
-                    catch
+
+                    var responseObj = new
                     {
-                        await SendJsonResponseAsync(stream, 400, "Bad Request", new { error = "Invalid JSON payload" }, keepAlive);
-                    }
+                        message = "Data received successfully",
+                        query = request.Query,
+                        receivedData = request.ParsedBody
+                    };
+                    await SendJsonResponseAsync(context, 200, "OK", responseObj);
                 }
                 else
                 {
-                    await SendResponseAsync(stream, 404, "Not Found", "text/plain", "Not Found", keepAlive);
+                    await SendResponseAsync(context, 404, "Not Found", "text/plain", "Not Found");
                 }
             }
             else
             {
-                await SendResponseAsync(stream, 405, "Method Not Allowed", "text/plain", "Method Not Allowed", keepAlive);
+                await SendResponseAsync(context, 405, "Method Not Allowed", "text/plain", "Method Not Allowed");
             }
         }
 
-        static async Task ServeStaticFileAsync(SslStream stream, string path, bool keepAlive)
+        static (string Path, string QueryString, Dictionary<string, List<string>> Query) ParseUrl(string fullUrl)
+        {
+            string path = fullUrl;
+            string queryString = "";
+            int queryIdx = fullUrl.IndexOf('?');
+            if (queryIdx >= 0)
+            {
+                path = fullUrl.Substring(0, queryIdx);
+                queryString = fullUrl.Substring(queryIdx + 1);
+            }
+
+            return (Uri.UnescapeDataString(path), queryString, ParseQueryString(queryString));
+        }
+
+        static Dictionary<string, List<string>> ParseQueryString(string queryString)
+        {
+            var values = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+            if (string.IsNullOrWhiteSpace(queryString))
+            {
+                return values;
+            }
+
+            foreach (string pair in queryString.Split('&', StringSplitOptions.RemoveEmptyEntries))
+            {
+                string[] parts = pair.Split('=', 2);
+                string key = UrlDecode(parts[0]);
+                string value = parts.Length > 1 ? UrlDecode(parts[1]) : "";
+
+                if (!values.TryGetValue(key, out List<string>? existingValues))
+                {
+                    existingValues = new List<string>();
+                    values[key] = existingValues;
+                }
+
+                existingValues.Add(value);
+            }
+
+            return values;
+        }
+
+        static object? ParseRequestBody(Dictionary<string, string> headers, string body)
+        {
+            if (string.IsNullOrWhiteSpace(body))
+            {
+                return null;
+            }
+
+            headers.TryGetValue("Content-Type", out string? contentType);
+            contentType ??= "";
+
+            if (contentType.Contains("application/json", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    return JsonSerializer.Deserialize<object>(body);
+                }
+                catch (JsonException)
+                {
+                    return null;
+                }
+            }
+
+            if (contentType.Contains("application/x-www-form-urlencoded", StringComparison.OrdinalIgnoreCase))
+            {
+                return ParseQueryString(body);
+            }
+
+            if (contentType.StartsWith("text/", StringComparison.OrdinalIgnoreCase))
+            {
+                return body;
+            }
+
+            return null;
+        }
+
+        static string UrlDecode(string value)
+        {
+            return Uri.UnescapeDataString(value.Replace("+", " "));
+        }
+
+        static async Task ServeStaticFileAsync(HttpContext context, string path)
         {
             string filePath = Path.Combine(PublicDir, path.TrimStart('/'));
             filePath = Path.GetFullPath(filePath);
             
             // Strong path traversal prevention
-            if (!filePath.StartsWith(PublicDir, StringComparison.OrdinalIgnoreCase))
+            string publicRoot = Path.GetFullPath(PublicDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            if (!filePath.StartsWith(publicRoot, StringComparison.OrdinalIgnoreCase))
             {
-                await SendResponseAsync(stream, 403, "Forbidden", "text/plain", "Forbidden", keepAlive);
+                await SendResponseAsync(context, 403, "Forbidden", "text/plain", "Forbidden");
                 return;
             }
 
@@ -262,7 +427,7 @@ namespace HttpsServer
                 byte[] fileBytes = await File.ReadAllBytesAsync(filePath);
                 
                 string eTag = $"\"{ComputeSha256Hash(fileBytes)}\"";
-                string connectionHeader = keepAlive ? "keep-alive" : "close";
+                string connectionHeader = context.Request.KeepAlive ? "keep-alive" : "close";
                 
                 StringBuilder headers = new StringBuilder();
                 headers.Append($"HTTP/1.1 200 OK\r\n");
@@ -277,26 +442,27 @@ namespace HttpsServer
                 headers.Append("\r\n");
                 
                 byte[] headerBytes = Encoding.UTF8.GetBytes(headers.ToString());
-                await stream.WriteAsync(headerBytes);
-                await stream.WriteAsync(fileBytes);
-                await stream.FlushAsync();
+                await context.Stream.WriteAsync(headerBytes);
+                await context.Stream.WriteAsync(fileBytes);
+                await context.Stream.FlushAsync();
+                context.ResponseStarted = true;
             }
             else
             {
-                await SendResponseAsync(stream, 404, "Not Found", "text/html", "<html><body><h1>404 Not Found</h1></body></html>", keepAlive);
+                await SendResponseAsync(context, 404, "Not Found", "text/html", "<html><body><h1>404 Not Found</h1></body></html>");
             }
         }
 
-        static async Task SendJsonResponseAsync(SslStream stream, int statusCode, string statusText, object data, bool keepAlive)
+        static async Task SendJsonResponseAsync(HttpContext context, int statusCode, string statusText, object data)
         {
             string json = JsonSerializer.Serialize(data);
-            await SendResponseAsync(stream, statusCode, statusText, "application/json", json, keepAlive);
+            await SendResponseAsync(context, statusCode, statusText, "application/json", json);
         }
 
-        static async Task SendResponseAsync(SslStream stream, int statusCode, string statusText, string contentType, string body, bool keepAlive, bool isCorsOptions = false)
+        static async Task SendResponseAsync(HttpContext context, int statusCode, string statusText, string contentType, string body, bool isCorsOptions = false)
         {
             byte[] bodyBytes = Encoding.UTF8.GetBytes(body);
-            string connectionHeader = keepAlive ? "keep-alive" : "close";
+            string connectionHeader = context.Request.KeepAlive ? "keep-alive" : "close";
             
             StringBuilder headers = new StringBuilder();
             headers.Append($"HTTP/1.1 {statusCode} {statusText}\r\n");
@@ -317,9 +483,10 @@ namespace HttpsServer
             headers.Append("\r\n");
 
             byte[] headerBytes = Encoding.UTF8.GetBytes(headers.ToString());
-            await stream.WriteAsync(headerBytes);
-            await stream.WriteAsync(bodyBytes);
-            await stream.FlushAsync();
+            await context.Stream.WriteAsync(headerBytes);
+            await context.Stream.WriteAsync(bodyBytes);
+            await context.Stream.FlushAsync();
+            context.ResponseStarted = true;
         }
 
         static string ComputeSha256Hash(byte[] rawData)
@@ -355,4 +522,3 @@ namespace HttpsServer
         }
     }
 }
-
